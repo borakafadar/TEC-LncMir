@@ -1,0 +1,11 @@
+/ciceklab/data_with_negatives
+/ciceklab/training_chunks
+/ciceklab/notes.md
+/ciceklab/protein.fa
+/ciceklab/rna.fa
+/ciceklab/seq_index.pkl
+/ciceklab/output_smoke/
+/ciceklab/output_full/
+/ciceklab/output_eval/
+__pycache__/
+*.pyc
