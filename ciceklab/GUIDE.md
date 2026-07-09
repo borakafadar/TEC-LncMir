@@ -52,15 +52,7 @@ The JSONL records can have the miRNA-lncRNA pair in **either order**:
 Our adapter handles both orderings and always returns `(lncRNA_seq, miRNA_seq, label)`.
 
 ### 3. ID→Sequence Resolution
-The JSONL data uses mixed ID formats:
-- `MI0*` — miRBase precursor IDs
-- `MIMAT*` — miRBase mature IDs  
-- `hsa-miR-*` — mature miRNA names
-- `NONHSAG*`, `NONHSAT*` — NONCODE human lncRNA IDs
-- `NONMMUG*`, `NONMMUT*` — NONCODE mouse lncRNA IDs
-- `ENST*`, `ENSG*`, `ENSMUSG*` — Ensembl IDs
-
-We pre-scan `rna.fa` to build an index of all these IDs. **Pairs where either ID is not found in `rna.fa` are silently skipped.**
+Rather than relying on regex patterns to filter `rna.fa`, `build_seq_index.py` first scans all training chunks and evaluation datasets (`training_chunks/*.jsonl` and `data_with_negatives/rna_rna/miRNA_lncRNA/*.jsonl`) to collect the exact set of required miRNA and lncRNA IDs. It then performs a single streaming pass over `rna.fa` to extract only those exact sequences into `seq_index.pkl`. Any pairs whose ID is not found in `rna.fa` are logged and silently skipped.
 
 ### 4. lncRNA Length Cutoff
 Following the paper, lncRNA sequences longer than **25,000 bases** are excluded due to GPU memory constraints.

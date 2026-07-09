@@ -3,64 +3,86 @@
 """
 build_seq_index.py
 ==================
-One-time preprocessing script that scans rna.fa and builds a fast
-pickle lookup dictionary mapping RNA IDs → sequences.
-
-Only keeps records whose IDs match known miRNA / lncRNA patterns:
-  - hsa-miR-*, hsa-mir-*, MI0*, MIMAT*          (miRNA)
-  - NONHSAG*, NONHSAT*, NONMMUG*, NONMMUT*      (NONCODE lncRNA)
-  - ENST*, ENSMUSG*, ENSG*                       (Ensembl transcripts)
+One-time preprocessing script that:
+  1. Scans all training chunks and validation/test JSONL files to collect
+     the exact set of unique miRNA and lncRNA IDs used in the dataset.
+  2. Scans rna.fa in a single streaming pass to extract sequences for
+     those exact IDs.
+  3. Saves the resulting dictionary to seq_index.pkl.
 
 Usage:
     python build_seq_index.py [--rna-fa PATH] [--output PATH]
 
 Outputs:
-    seq_index.pkl  — dict[str, str] mapping ID → uppercase RNA sequence
+    seq_index.pkl — dict[str, str] mapping ID → uppercase RNA sequence
 """
 
 import argparse
+import glob
+import json
 import os
 import pickle
-import re
 import sys
 import time
 
 
-# Patterns that identify relevant RNA records
-KEEP_PATTERNS = [
-    re.compile(r'^hsa-mi[Rr]', re.IGNORECASE),   # mature miRNA names
-    re.compile(r'^MI\d{5,}'),                       # miRBase precursor IDs
-    re.compile(r'^MIMAT\d+'),                       # miRBase mature IDs
-    re.compile(r'^NONHSAG\d+'),                     # NONCODE human gene
-    re.compile(r'^NONHSAT\d+'),                      # NONCODE human transcript
-    re.compile(r'^NONMMUG\d+'),                      # NONCODE mouse gene
-    re.compile(r'^NONMMUT\d+'),                      # NONCODE mouse transcript
-    re.compile(r'^ENST\d+'),                         # Ensembl transcript
-    re.compile(r'^ENSMUSG\d+'),                      # Ensembl mouse gene
-    re.compile(r'^ENSG\d+'),                         # Ensembl human gene
-]
-
-
-def should_keep(record_id: str) -> bool:
-    """Check if a FASTA record ID matches any of our keep patterns."""
-    for pat in KEEP_PATTERNS:
-        if pat.match(record_id):
-            return True
-    return False
-
-
-def build_index_streaming(fasta_path: str) -> dict:
+def collect_needed_ids(train_chunks_dir: str, valid_test_dir: str) -> set:
     """
-    Build the sequence index by streaming the FASTA file line-by-line.
-    This avoids loading the entire 1.8GB file into memory via BioPython.
+    Collect all unique miRNA and lncRNA IDs referenced across
+    training chunks and validation/test datasets.
+    """
+    needed_ids = set()
+    total_records = 0
+    mirna_lncrna_pairs = 0
+
+    # Collect from training chunks
+    chunk_files = sorted(glob.glob(os.path.join(train_chunks_dir, "chunk_*.jsonl")))
+    print(f"Collecting unique IDs from {len(chunk_files)} training chunks...")
+    for cf in chunk_files:
+        with open(cf, 'r') as f:
+            for line in f:
+                total_records += 1
+                record = json.loads(line.strip())
+                if record.get('interaction_type') != 'rna-rna':
+                    continue
+                t1 = record.get('RNA_type', '').lower()
+                t2 = record.get('target_RNA_type', '').lower()
+                if (t1 == 'mirna' and t2 == 'lncrna') or (t1 == 'lncrna' and t2 == 'mirna'):
+                    mirna_lncrna_pairs += 1
+                    needed_ids.add(record['RNA_id'])
+                    needed_ids.add(record['target_id'])
+
+    # Collect from validation/test datasets
+    eval_files = sorted(glob.glob(os.path.join(valid_test_dir, "*.jsonl")))
+    print(f"Collecting unique IDs from {len(eval_files)} evaluation files...")
+    for ef in eval_files:
+        with open(ef, 'r') as f:
+            for line in f:
+                record = json.loads(line.strip())
+                if record.get('interaction_type') != 'rna-rna':
+                    continue
+                t1 = record.get('RNA_type', '').lower()
+                t2 = record.get('target_RNA_type', '').lower()
+                if (t1 == 'mirna' and t2 == 'lncrna') or (t1 == 'lncrna' and t2 == 'mirna'):
+                    needed_ids.add(record['RNA_id'])
+                    needed_ids.add(record['target_id'])
+
+    print(f"  Found {mirna_lncrna_pairs:,} miRNA-lncRNA pairs across datasets.")
+    print(f"  Total unique required IDs to extract: {len(needed_ids):,}")
+    return needed_ids
+
+
+def build_index_streaming(fasta_path: str, needed_ids: set) -> dict:
+    """
+    Build the sequence index by streaming rna.fa line-by-line,
+    keeping only IDs present in needed_ids.
     """
     seq_index = {}
     current_id = None
     current_seq_parts = []
     records_scanned = 0
-    records_kept = 0
 
-    print(f"Scanning {fasta_path} ...")
+    print(f"\nScanning {fasta_path} for {len(needed_ids):,} exact IDs...")
     start_time = time.time()
 
     with open(fasta_path, 'r') as f:
@@ -71,94 +93,71 @@ def build_index_streaming(fasta_path: str) -> dict:
 
             if line.startswith('>'):
                 # Save previous record if it matched
-                if current_id is not None and should_keep(current_id):
-                    seq = ''.join(current_seq_parts).upper()
-                    # Normalize T → U for RNA
-                    seq = seq.replace('T', 'U')
+                if current_id is not None and current_id in needed_ids:
+                    seq = ''.join(current_seq_parts).upper().replace('T', 'U')
                     seq_index[current_id] = seq
-                    records_kept += 1
 
                 records_scanned += 1
                 if records_scanned % 2_000_000 == 0:
                     elapsed = time.time() - start_time
                     print(f"  Scanned {records_scanned:,} records, "
-                          f"kept {records_kept:,} ... ({elapsed:.0f}s)")
+                          f"found {len(seq_index):,}/{len(needed_ids):,} IDs... ({elapsed:.0f}s)")
 
-                # Parse the new record ID (first whitespace-delimited token)
-                header = line[1:]  # remove '>'
+                # Parse FASTA header ID (first token before whitespace or pipe)
+                header = line[1:]
                 current_id = header.split()[0].split('|')[0]
                 current_seq_parts = []
             else:
-                current_seq_parts.append(line)
+                if current_id in needed_ids:
+                    current_seq_parts.append(line)
 
-    # Don't forget the last record
-    if current_id is not None and should_keep(current_id):
-        seq = ''.join(current_seq_parts).upper()
-        seq = seq.replace('T', 'U')
+    # Last record
+    if current_id is not None and current_id in needed_ids:
+        seq = ''.join(current_seq_parts).upper().replace('T', 'U')
         seq_index[current_id] = seq
-        records_kept += 1
     records_scanned += 1
 
     elapsed = time.time() - start_time
-    print(f"\nDone! Scanned {records_scanned:,} records in {elapsed:.1f}s")
-    print(f"Kept {records_kept:,} sequences in index")
+    print(f"\nDone! Scanned {records_scanned:,} FASTA records in {elapsed:.1f}s")
+    print(f"Successfully matched and indexed {len(seq_index):,} / {len(needed_ids):,} required IDs.")
+
+    missing_ids = needed_ids - set(seq_index.keys())
+    if missing_ids:
+        print(f"Note: {len(missing_ids)} IDs referenced in datasets were not found in {os.path.basename(fasta_path)}.")
 
     return seq_index
 
 
-def print_summary(seq_index: dict):
-    """Print a summary of what's in the index."""
-    mirna_count = 0
-    lncrna_noncode = 0
-    lncrna_ensembl = 0
-    other = 0
-
-    lengths = []
-    for rid, seq in seq_index.items():
-        lengths.append(len(seq))
-        if rid.startswith('hsa-mi') or rid.startswith('MI0') or rid.startswith('MIMAT'):
-            mirna_count += 1
-        elif rid.startswith('NON'):
-            lncrna_noncode += 1
-        elif rid.startswith('ENS'):
-            lncrna_ensembl += 1
-        else:
-            other += 1
-
-    print(f"\nIndex summary:")
-    print(f"  miRNA records:          {mirna_count:,}")
-    print(f"  lncRNA (NONCODE):       {lncrna_noncode:,}")
-    print(f"  lncRNA/RNA (Ensembl):   {lncrna_ensembl:,}")
-    print(f"  Other:                  {other:,}")
-    print(f"  Total:                  {len(seq_index):,}")
-    if lengths:
-        print(f"  Sequence lengths: min={min(lengths)}, "
-              f"max={max(lengths)}, median={sorted(lengths)[len(lengths)//2]}")
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Build sequence index from rna.fa")
+    parser = argparse.ArgumentParser(description="Build exact sequence index from rna.fa based on dataset IDs")
     parser.add_argument("--rna-fa", type=str,
                         default=os.path.join(os.path.dirname(__file__), "rna.fa"),
-                        help="Path to rna.fa (default: ciceklab/rna.fa)")
+                        help="Path to rna.fa")
+    parser.add_argument("--train-chunks", type=str,
+                        default=os.path.join(os.path.dirname(__file__), "training_chunks"),
+                        help="Path to training_chunks directory")
+    parser.add_argument("--valid-dir", type=str,
+                        default=os.path.join(os.path.dirname(__file__),
+                                             "data_with_negatives", "rna_rna", "miRNA_lncRNA"),
+                        help="Path to evaluation datasets directory")
     parser.add_argument("--output", type=str,
                         default=os.path.join(os.path.dirname(__file__), "seq_index.pkl"),
-                        help="Output pickle file path (default: ciceklab/seq_index.pkl)")
+                        help="Output pickle file path")
     args = parser.parse_args()
 
     if not os.path.exists(args.rna_fa):
         print(f"ERROR: {args.rna_fa} not found!")
         sys.exit(1)
 
-    seq_index = build_index_streaming(args.rna_fa)
-    print_summary(seq_index)
+    needed_ids = collect_needed_ids(args.train_chunks, args.valid_dir)
+    seq_index = build_index_streaming(args.rna_fa, needed_ids)
 
     print(f"\nSaving to {args.output} ...")
     with open(args.output, 'wb') as f:
         pickle.dump(seq_index, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     file_size_mb = os.path.getsize(args.output) / (1024 * 1024)
-    print(f"Saved! File size: {file_size_mb:.1f} MB")
+    print(f"Saved! File size: {file_size_mb:.2f} MB")
 
 
 if __name__ == "__main__":
