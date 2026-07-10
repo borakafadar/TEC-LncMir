@@ -8,7 +8,7 @@ Designed for a remote server with GPU(s).
 
 Features:
   - Streams through all 346 training chunks per epoch
-  - 300 epochs (paper default)
+  - Configurable epochs (default: 10 for full Ciceklab dataset; paper used 300 on tiny datasets)
   - Validates on all 3 validation splits periodically
   - Best model selection based on MCC
   - Optional data augmentation (k-mer offset shifting)
@@ -82,20 +82,33 @@ def build_kmer_dict(k: int) -> dict:
     return vocab
 
 
+# Global caches for sequence tokenization to avoid repeated CPU slicing across chunks/epochs
+_LNC_TOKEN_CACHE = {}
+_MI_TOKEN_CACHE = {}
+
+
 def tokenize_batch(lnc_seqs, mi_seqs, base_number_dict_mirna, base_number_dict_lnc, device):
-    """Tokenize a batch of lncRNA and miRNA sequences."""
-    unique_mi = list(set(mi_seqs))
-    unique_lnc = list(set(lnc_seqs))
+    """Tokenize a batch of lncRNA and miRNA sequences with memory caching."""
+    embeddings = {}
 
-    mirnas = [[s, s.replace('-', '').replace('>', '').replace('T', 'U')] for s in unique_mi]
-    lncrnas = [[s, s.replace('-', '').replace('>', '').replace('T', 'U')] for s in unique_lnc]
+    for s in set(mi_seqs):
+        if s not in _MI_TOKEN_CACHE:
+            clean = s.replace('-', '').replace('>', '').replace('T', 'U')
+            tokens = [base_number_dict_mirna.get(c, 1) for c in clean]
+            _MI_TOKEN_CACHE[s] = torch.LongTensor(tokens)
+        embeddings[s] = _MI_TOKEN_CACHE[s].to(device)
 
-    rna_list = get_tokens(mirnas, base_number_dict_mirna) + get_tokens_word(lncrnas, base_number_dict_lnc)
+    one_word = int(np.log(len(base_number_dict_lnc))/np.log(4)) if len(base_number_dict_lnc) > 0 else 1
+    for s in set(lnc_seqs):
+        if s not in _LNC_TOKEN_CACHE:
+            clean = s.replace('-', '').replace('>', '').replace('T', 'U')
+            tokens = []
+            for j in range(len(clean) // one_word):
+                kmer = clean[j * one_word : (j + 1) * one_word]
+                tokens.append(base_number_dict_lnc.get(kmer, 1))
+            _LNC_TOKEN_CACHE[s] = torch.LongTensor(tokens)
+        embeddings[s] = _LNC_TOKEN_CACHE[s].to(device)
 
-    for i in range(len(rna_list)):
-        rna_list[i][1] = torch.LongTensor(rna_list[i][1]).to(device)
-
-    embeddings = {rna_list[i][0]: rna_list[i][1] for i in range(len(rna_list))}
     return embeddings
 
 
@@ -116,7 +129,7 @@ def augment_lncrna_seq(seq: str, k: int = 4) -> list:
 # ---------------------------------------------------------------------------
 
 def train_step(args, model, lnc_seqs, mi_seqs, y,
-               base_number_dict_mirna, base_number_dict_lnc, device):
+               base_number_dict_mirna, base_number_dict_lnc, device, scaler=None):
     """Forward + backward pass for one batch."""
     embeddings = tokenize_batch(lnc_seqs, mi_seqs, base_number_dict_mirna,
                                  base_number_dict_lnc, device)
@@ -130,13 +143,20 @@ def train_step(args, model, lnc_seqs, mi_seqs, y,
     z_a = torch.nn.utils.rnn.pad_sequence(z_a, batch_first=True).reshape(b, -1, 1)
     z_b = torch.nn.utils.rnn.pad_sequence(z_b, batch_first=True).reshape(b, -1, 1)
 
-    c_map_mag, p_hat = model.map_predict(z_a, z_b)
-
     y = y.to(device)
     y = Variable(y)
-    p_hat = p_hat.float()
-    bce_loss = F.binary_cross_entropy(p_hat, y.float())
-    bce_loss.backward()
+
+    if scaler is not None:
+        with torch.cuda.amp.autocast():
+            c_map_mag, p_hat = model.map_predict(z_a, z_b)
+            p_hat = p_hat.float()
+            bce_loss = F.binary_cross_entropy(p_hat, y.float())
+        scaler.scale(bce_loss).backward()
+    else:
+        c_map_mag, p_hat = model.map_predict(z_a, z_b)
+        p_hat = p_hat.float()
+        bce_loss = F.binary_cross_entropy(p_hat, y.float())
+        bce_loss.backward()
 
     with torch.no_grad():
         p_guess = (p_hat > 0.5).float()
@@ -256,10 +276,10 @@ def main():
                                              "data_with_negatives", "rna_rna", "miRNA_lncRNA"))
 
     # Training settings
-    parser.add_argument("--num-epochs", type=int, default=300,
-                        help="Number of epochs (default: 300)")
-    parser.add_argument("--batch-size", type=int, default=16,
-                        help="Batch size (default: 16)")
+    parser.add_argument("--num-epochs", type=int, default=10,
+                        help="Number of epochs (default: 10; 1.4M pairs per epoch)")
+    parser.add_argument("--batch-size", type=int, default=64,
+                        help="Batch size (default: 64)")
     parser.add_argument("--lr", type=float, default=0.0001,
                         help="Learning rate (default: 0.0001)")
     parser.add_argument("--weight-decay", type=float, default=0,
@@ -270,6 +290,8 @@ def main():
                         help="Enable data augmentation (k-mer offset shifting)")
     parser.add_argument("--max-chunks", type=int, default=None,
                         help="Limit number of training chunks (default: all)")
+    parser.add_argument("--amp", action="store_true",
+                        help="Enable Automatic Mixed Precision (FP16) for faster GPU training")
 
     # Model hyperparameters
     parser.add_argument("--input-dim", type=int, default=128)
@@ -283,8 +305,8 @@ def main():
     parser.add_argument("--p0", type=float, default=0.5)
 
     # Validation frequency
-    parser.add_argument("--val-every-n-chunks", type=int, default=50,
-                        help="Validate after every N chunks (default: 50)")
+    parser.add_argument("--val-every-n-chunks", type=int, default=173,
+                        help="Validate after every N chunks (default: 173)")
     parser.add_argument("--save-every-n-epochs", type=int, default=10,
                         help="Save checkpoint every N epochs (default: 10)")
 
@@ -369,6 +391,7 @@ def main():
     # Optimizer
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=args.weight_decay)
+    scaler = torch.cuda.amp.GradScaler() if args.amp and torch.cuda.is_available() else None
 
     # Training loop
     header = (f"\n{'='*70}\n"
@@ -421,8 +444,13 @@ def main():
                 loss, preds, labels = train_step(
                     args, model, lnc_seqs, mi_seqs, y,
                     base_number_dict_mirna, base_number_dict_lnc, args.device,
+                    scaler=scaler,
                 )
-                optimizer.step()
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
                 optimizer.zero_grad()
 
                 bs = len(lnc_seqs)

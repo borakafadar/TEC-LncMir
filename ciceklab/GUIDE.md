@@ -76,8 +76,8 @@ All hyperparameters match the paper's final configuration (Table from Section "T
 | `nl` | 4 | Transformer Encoder layers |
 | `ks` | 1 | CNN kernel size |
 | `lr` | 0.0001 | Learning rate (Adam) |
-| `batch_size` | 16 | Batch size |
-| `epochs` | 300 | Training epochs |
+| `batch_size` | 64 (default) / 16 (paper) | Larger batch size recommended for GPU saturation |
+| `epochs` | 10 (default) / 300 (paper) | 10 epochs on 1.4M pairs ≈ 14M samples (far exceeds 300 epochs on paper benchmark datasets) |
 | `dropout` | 0.0 | Dropout probability |
 | `seed` | 1234 | Random seed |
 
@@ -137,24 +137,24 @@ python train_smoke.py --device 0
 ### Step 2b: Full Training (GPU Server)
 
 ```bash
-# Standard training
-python train_full.py --device 0
+# Recommended training for Titan RTX / Modern GPU (FP16 AMP + Batch Size 64)
+python train_full.py --device 0 --amp --batch-size 64 --num-epochs 10
 
-# With data augmentation (recommended for best results)
-python train_full.py --device 0 --augment
+# With data augmentation
+python train_full.py --device 0 --amp --batch-size 64 --num-epochs 10 --augment
 
 # Custom settings
 python train_full.py \
     --device 0 \
-    --num-epochs 300 \
-    --batch-size 16 \
+    --num-epochs 10 \
+    --batch-size 64 \
     --lr 0.0001 \
-    --augment \
-    --val-every-n-chunks 50 \
-    --save-every-n-epochs 10
+    --amp \
+    --val-every-n-chunks 173 \
+    --save-every-n-epochs 2
 
 # Resume from checkpoint
-python train_full.py --device 0 --checkpoint output_full/checkpoint_epoch50.pt
+python train_full.py --device 0 --checkpoint output_full/checkpoint_epoch2.pt
 ```
 
 **What it does:**
