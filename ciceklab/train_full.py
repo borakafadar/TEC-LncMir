@@ -149,8 +149,8 @@ def train_step(args, model, lnc_seqs, mi_seqs, y,
     if scaler is not None:
         with torch.cuda.amp.autocast():
             c_map_mag, p_hat = model.map_predict(z_a, z_b)
-            p_hat = p_hat.float()
-            bce_loss = F.binary_cross_entropy(p_hat, y.float())
+        p_hat = p_hat.float()
+        bce_loss = F.binary_cross_entropy(p_hat, y.float())
         scaler.scale(bce_loss).backward()
     else:
         c_map_mag, p_hat = model.map_predict(z_a, z_b)
